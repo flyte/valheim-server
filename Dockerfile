@@ -43,9 +43,13 @@ USER root
 RUN apt-get update && apt-get -y install curl python3.8 python3.8-distutils
 RUN curl https://bootstrap.pypa.io/get-pip.py | python3.8
 
+RUN ln -s /usr/bin/python3.8 /usr/bin/python
 USER $USER
 
-RUN pip install --user python-a2s
-COPY run_server.py $HOME/
+RUN pip install --user python-a2s asyncio-mqtt
+
+COPY --chown=$USER:$USER run_server.py $HOME/
+
+ENV PYTHONUNBUFFERED 1
 
 CMD [ "python3.8", "run_server.py" ]
