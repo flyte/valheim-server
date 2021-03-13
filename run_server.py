@@ -3,14 +3,25 @@ import re
 import signal as signals
 import sys
 from asyncio.streams import StreamReader
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from os import environ as env
 from pathlib import Path
-from typing import AsyncGenerator, AsyncIterator, Optional, TextIO
+from types import TracebackType
+from typing import (
+    Any,
+    AsyncContextManager,
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    List,
+    Optional,
+    TextIO,
+    Type,
+)
 
-import a2s
-from asyncio_mqtt import Client as MQTTClient
+import a2s  # type: ignore
+from asyncio_mqtt import Client as MQTTClient  # type: ignore
 
 THIS_DIR = Path(__file__).parent.absolute()
 LD_LIBRARY_PATH = str(THIS_DIR.joinpath("vhserver/linux64"))
@@ -58,13 +69,13 @@ class ValheimServer:
             if not self.stopping.is_set():
                 self.stop_task = self.loop.create_task(self.stop())
             if self.proc is not None and self.sigints >= 2:
-                print("***Killing Server***")
+                print("*** Killing the server ***")
                 self.proc.kill()
                 self.finished.set()
 
         self.loop.add_signal_handler(signals.SIGINT, sigint_handler)
 
-    def handle_locations_generated(self, match):
+    def handle_locations_generated(self, match: re.Match[Any]) -> None:
         self.started.set()
 
     @asynccontextmanager
@@ -74,6 +85,8 @@ class ValheimServer:
         async def log_generator() -> AsyncGenerator[str, None]:
             finished = self.loop.create_task(self.finished.wait())
             while not self.finished.is_set():
+                if self.log_line_queue is None:
+                    return
                 log_line = self.loop.create_task(self.log_line_queue.get())
                 done, _ = await asyncio.wait(
                     (finished, log_line), return_when=asyncio.FIRST_COMPLETED
@@ -82,12 +95,12 @@ class ValheimServer:
                     return
                 yield await log_line
 
-        yield log_generator
+        yield log_generator()
         self.log_line_queue = None
 
-    async def __aenter__(self):
-        args = [
-            THIS_DIR.joinpath("vhserver/valheim_server.x86_64"),
+    async def __aenter__(self) -> AsyncContextManager[AsyncGenerator[str, None]]:
+        args: List[str] = [
+            str(THIS_DIR.joinpath("vhserver/valheim_server.x86_64")),
             "-name",
             self.name,
             "-port",
@@ -114,11 +127,17 @@ class ValheimServer:
 
         return self.log_lines()
 
-    async def __aexit__(self, exc_type, exc, tb):
+    async def __aexit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc: Optional[BaseException],
+        tb: Optional[TracebackType],
+    ) -> Optional[bool]:
         if not self.stopping.is_set():
             await self.stop()
+        return None
 
-    async def stop(self):
+    async def stop(self) -> None:
         print("*** Stopping the server ***")
         self.stopping.set()
         if self.proc is not None and self.proc.returncode is None:
@@ -130,16 +149,16 @@ class ValheimServer:
 
         self.finished.set()
 
-        self.stdout_task.cancel()
-        self.stderr_task.cancel()
-        self.status_task.cancel()
-        await asyncio.gather(
-            self.stdout_task, self.stderr_task, self.status_task, return_exceptions=True
-        )
+        tasks = [
+            t
+            for t in (self.stdout_task, self.stderr_task, self.status_task)
+            if t is not None
+        ]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def print_pipe(self, input: StreamReader, output: TextIO) -> None:
-        while self.proc is None:
-            await asyncio.sleep(1)
         while True:
             line = (await input.readline()).decode("utf8")
             if not line:
@@ -156,9 +175,17 @@ class ValheimServer:
                     handler(match)
 
     async def print_stdout(self) -> None:
+        while self.proc is None:
+            await asyncio.sleep(1)
+        if self.proc.stdout is None:
+            return
         await self.print_pipe(self.proc.stdout, sys.stdout)
 
     async def print_stderr(self) -> None:
+        while self.proc is None:
+            await asyncio.sleep(1)
+        if self.proc.stderr is None:
+            return
         await self.print_pipe(self.proc.stderr, sys.stderr)
 
     async def print_status(self) -> None:
@@ -181,12 +208,26 @@ class ValheimServer:
             await asyncio.sleep(10)
 
 
-def main():
-    async def async_main():
-        async with ValheimServer("Test", "noworld", "testingzzzzzzzz") as vhs:
-            async with vhs as log_lines:
-                async for line in log_lines():
-                    print("oooo")
+async def publish_logs(
+    mqtt: MQTTClient, log_line_generator: AsyncGenerator[str, None]
+) -> None:
+    async for line in log_line_generator:
+        await mqtt.publish("flyte/valheim", line.strip())
+
+
+def main() -> None:
+    async def async_main() -> None:
+        async with AsyncExitStack() as stack:
+            mqtt = await stack.enter_async_context(MQTTClient("test.mosquitto.org"))
+            vhs: AsyncContextManager[
+                AsyncGenerator[str, None]
+            ] = await stack.enter_async_context(
+                ValheimServer("Test", "noworld", "testingzzzzzzzz")
+            )
+            log_lines = await stack.enter_async_context(vhs)
+            await asyncio.gather(
+                publish_logs(mqtt, log_lines),
+            )
 
     asyncio.run(async_main())
 
