@@ -1,9 +1,12 @@
 import asyncio
+from asyncio.exceptions import CancelledError
+from asyncio.tasks import Task
+import json
 import re
 import signal as signals
 import sys
 from asyncio.streams import StreamReader
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass
 from os import environ as env
 from pathlib import Path
@@ -14,11 +17,15 @@ from typing import (
     AsyncGenerator,
     AsyncIterator,
     Awaitable,
+    Dict,
     List,
     Optional,
     TextIO,
     Type,
+    TypeVar,
 )
+
+T = TypeVar("T")
 
 import a2s  # type: ignore
 from asyncio_mqtt import Client as MQTTClient  # type: ignore
@@ -49,9 +56,9 @@ class ValheimServer:
         self.loop = asyncio.get_event_loop()
         self.sigints = 0
 
-        self.started = asyncio.Event()
-        self.stopping = asyncio.Event()
-        self.finished = asyncio.Event()
+        self.started_event = asyncio.Event()
+        self.stopping_event = asyncio.Event()
+        self.finished_event = asyncio.Event()
 
         self.stdout_task: "Optional[asyncio.Task[None]]" = None
         self.stderr_task: "Optional[asyncio.Task[None]]" = None
@@ -59,46 +66,70 @@ class ValheimServer:
         self.stop_task: "Optional[asyncio.Task[None]]" = None
 
         self.log_line_queue: "Optional[asyncio.Queue[str]]" = None
+        self.status_queue: "Optional[asyncio.Queue[Dict[str, Any]]]" = None
+        self.saved_queue: "Optional[asyncio.Queue[None]]" = None
 
         self.log_triggers = {
-            r".+Done generating locations.+": self.handle_locations_generated
+            r".+Done generating locations.+": self.handle_locations_generated,
+            r".+: World saved \( .+": self.handle_world_saved,
         }
 
         def sigint_handler() -> None:
             self.sigints += 1
-            if not self.stopping.is_set():
+            if not self.stopping_event.is_set():
                 self.stop_task = self.loop.create_task(self.stop())
             if self.proc is not None and self.sigints >= 2:
                 print("*** Killing the server ***")
-                self.proc.kill()
-                self.finished.set()
+                with suppress(ProcessLookupError):
+                    self.proc.kill()
+                self.finished_event.set()
+            elif self.sigints >= 3:
+                print("*** Cancelling all tasks ***")
+                for task in asyncio.all_tasks():
+                    task.cancel()
 
         self.loop.add_signal_handler(signals.SIGINT, sigint_handler)
 
-    def handle_locations_generated(self, match: re.Match[Any]) -> None:
-        self.started.set()
+    def handle_locations_generated(self, match: "re.Match[Any]") -> None:
+        if not self.stopping_event.is_set():
+            self.started_event.set()
+
+    def handle_world_saved(self, match: "re.Match[Any]") -> None:
+        if self.saved_queue is not None:
+            self.saved_queue.put_nowait(None)
 
     @asynccontextmanager
     async def log_lines(self) -> AsyncIterator[AsyncGenerator[str, None]]:
         self.log_line_queue = asyncio.Queue()
-
-        async def log_generator() -> AsyncGenerator[str, None]:
-            finished = self.loop.create_task(self.finished.wait())
-            while not self.finished.is_set():
-                if self.log_line_queue is None:
-                    return
-                log_line = self.loop.create_task(self.log_line_queue.get())
-                done, _ = await asyncio.wait(
-                    (finished, log_line), return_when=asyncio.FIRST_COMPLETED
-                )
-                if finished in done:
-                    return
-                yield await log_line
-
-        yield log_generator()
+        yield self._queue_generator(self.log_line_queue)
         self.log_line_queue = None
 
-    async def __aenter__(self) -> AsyncContextManager[AsyncGenerator[str, None]]:
+    @asynccontextmanager
+    async def status_updates(self) -> AsyncIterator[AsyncGenerator[Dict[str, Any], None]]:
+        self.status_queue = asyncio.Queue()
+        yield self._queue_generator(self.status_queue)
+        self.status_queue = None
+
+    @asynccontextmanager
+    async def saved_updates(self) -> AsyncIterator[AsyncGenerator[None, None]]:
+        self.saved_queue = asyncio.Queue()
+        yield self._queue_generator(self.saved_queue)
+        self.saved_queue = None
+
+    async def _queue_generator(
+        self, queue: "asyncio.Queue[T]"
+    ) -> AsyncGenerator[T, None]:
+        stopping = self.loop.create_task(self.stopping_event.wait())
+        while not self.stopping_event.is_set():
+            item = self.loop.create_task(queue.get())
+            done, _ = await asyncio.wait(
+                (stopping, item), return_when=asyncio.FIRST_COMPLETED
+            )
+            if stopping in done:
+                return
+            yield await item
+
+    async def __aenter__(self) -> "ValheimServer":
         args: List[str] = [
             str(THIS_DIR.joinpath("vhserver/valheim_server.x86_64")),
             "-name",
@@ -125,7 +156,7 @@ class ValheimServer:
         self.stderr_task = self.loop.create_task(self.print_stderr())
         self.status_task = self.loop.create_task(self.print_status())
 
-        return self.log_lines()
+        return self
 
     async def __aexit__(
         self,
@@ -133,21 +164,20 @@ class ValheimServer:
         exc: Optional[BaseException],
         tb: Optional[TracebackType],
     ) -> Optional[bool]:
-        if not self.stopping.is_set():
+        if not self.stopping_event.is_set():
             await self.stop()
         return None
 
     async def stop(self) -> None:
         print("*** Stopping the server ***")
-        self.stopping.set()
-        if self.proc is not None and self.proc.returncode is None:
-            # Maybe just try catching the case in which the process doesn't exist,
-            # because it could quit at any moment, even though returncode is not None.
-            self.proc.send_signal(signals.SIGINT)
+        self.stopping_event.set()
+        if self.proc is not None:
+            with suppress(ProcessLookupError):
+                self.proc.send_signal(signals.SIGINT)
             exit_code = await self.proc.wait()
             print(f"Server exited with code {exit_code}")
 
-        self.finished.set()
+        self.finished_event.set()
 
         tasks = [
             t
@@ -190,8 +220,8 @@ class ValheimServer:
 
     async def print_status(self) -> None:
         address = ("localhost", self.port + 1)
-        await self.started.wait()
-        while not self.stopping.is_set():
+        await self.started_event.wait()
+        while not self.stopping_event.is_set():
             try:
                 info, players = await asyncio.gather(
                     a2s.ainfo(address),
@@ -205,6 +235,10 @@ class ValheimServer:
                 continue
             print(info)
             print(players)
+            if self.status_queue is not None:
+                status = dict(info)
+                status["players"] = [dict(p) for p in players]
+                self.status_queue.put_nowait(status)
             await asyncio.sleep(10)
 
 
@@ -212,22 +246,67 @@ async def publish_logs(
     mqtt: MQTTClient, log_line_generator: AsyncGenerator[str, None]
 ) -> None:
     async for line in log_line_generator:
-        await mqtt.publish("flyte/valheim", line.strip())
+        await mqtt.publish("flyte/valheim/log", line.strip())
+
+
+async def publish_status(
+    mqtt: MQTTClient, status_generator: AsyncGenerator[Dict[str, Any], None]
+) -> None:
+    async for status in status_generator:
+        await mqtt.publish("flyte/valheim/status", json.dumps(status))
+
+
+async def publish_saved(
+    mqtt: MQTTClient, saved_generator: AsyncGenerator[None, None]
+) -> None:
+    async for saved in saved_generator:
+        await mqtt.publish("flyte/valheim/saved")
+
+
+async def publish_started(mqtt: MQTTClient, vhs: ValheimServer) -> None:
+    await vhs.started_event.wait()
+    await mqtt.publish("flyte/valheim/state", "started")
+
+
+async def publish_stopping(mqtt: MQTTClient, vhs: ValheimServer) -> None:
+    await vhs.stopping_event.wait()
+    await mqtt.publish("flyte/valheim/state", "stopping")
 
 
 def main() -> None:
     async def async_main() -> None:
-        async with AsyncExitStack() as stack:
-            mqtt = await stack.enter_async_context(MQTTClient("test.mosquitto.org"))
-            vhs: AsyncContextManager[
-                AsyncGenerator[str, None]
-            ] = await stack.enter_async_context(
-                ValheimServer("Test", "noworld", "testingzzzzzzzz")
-            )
-            log_lines = await stack.enter_async_context(vhs)
-            await asyncio.gather(
-                publish_logs(mqtt, log_lines),
-            )
+        async with MQTTClient("test.mosquitto.org") as mqtt:
+            async with AsyncExitStack() as stack:
+                vhs: ValheimServer = await stack.enter_async_context(
+                    ValheimServer("Test", "noworld", "testingzzzzzzzz")
+                )
+                log_lines = await stack.enter_async_context(vhs.log_lines())
+                statuses = await stack.enter_async_context(vhs.status_updates())
+                loop = asyncio.get_event_loop()
+                finished = loop.create_task(vhs.finished_event.wait())
+                await mqtt.publish("flyte/valheim/state", "starting")
+                coros = [
+                    publish_logs(mqtt, log_lines),
+                    publish_status(mqtt, statuses),
+                    publish_started(mqtt, vhs),
+                    publish_stopping(mqtt, vhs),
+                ]
+                tasks = [loop.create_task(coro) for coro in coros]
+                gather_future = asyncio.gather(*tasks)
+                try:
+                    await asyncio.wait(
+                        [finished, gather_future],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    for task in tasks:
+                        task.cancel()
+                    for task in tasks:
+                        with suppress(CancelledError):
+                            await task
+                    with suppress(CancelledError):
+                        await gather_future
+            await mqtt.publish("flyte/valheim/state", "stopped")
 
     asyncio.run(async_main())
 
