@@ -43,8 +43,8 @@ RUN steamcmd \
     +app_update $APP_ID \
     +quit
 
-COPY requirements.txt ./
+COPY --chown=${USER}:${USER} requirements.txt ./
 RUN pip install --user -r requirements.txt
 
-COPY run_server.py ./
-CMD [ "python3.8", "run_server.py" ]
+COPY --chown=${USER}:${USER} run_server.py run_server_trio.py utils.py ./
+CMD [ "python3.8", "run_server_trio.py" ]

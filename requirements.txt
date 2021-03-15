@@ -1,2 +1,4 @@
 python-a2s
-asyncio-mqtt
+trio==0.18.0
+trio-typing==0.5.0
+trio-paho-mqtt==0.3.1
