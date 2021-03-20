@@ -19,7 +19,8 @@ RUN dpkg --add-architecture i386 && \
         curl \
         python3.8 \
         python3.8-distutils \
-        steamcmd && \
+        steamcmd \
+        git && \
     rm -rf /var/lib/apt/lists/* && \
     curl https://bootstrap.pypa.io/get-pip.py | python3.8
 
@@ -45,6 +46,10 @@ RUN steamcmd \
 
 COPY --chown=${USER}:${USER} requirements.txt ./
 RUN pip install --user -r requirements.txt
+
+RUN mkdir -p $HOME/.config/unity3d/IronGate/Valheim && \
+    mkdir $HOME/worlds && \
+    ln -s $HOME/worlds $HOME/.config/unity3d/IronGate/Valheim/worlds
 
 COPY --chown=${USER}:${USER} run_server.py run_server_trio.py utils.py ./
 CMD [ "python3.8", "run_server_trio.py" ]
