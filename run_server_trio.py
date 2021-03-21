@@ -171,7 +171,7 @@ class ValheimServer:
                     LOG.info("Server exited with code %s", rc)
                     nursery.cancel_scope.cancel()
                 self._nursery = None
-                if rc <= 0 and False:  # TODO: Take out 'and False' when finished testing
+                if rc <= 0:
                     if self._server_restart_requested:
                         self._server_restart_requested = False
                     else:
@@ -191,6 +191,14 @@ class ValheimServer:
         self._server_restart_requested = True
         self.proc.send_signal(signal.SIGINT)
 
+    def terminate(self):
+        LOG.warning("*** Terminating server ***")
+        self.proc.terminate()
+
+    def kill(self):
+        LOG.warning("*** Killing server ***")
+        self.proc.kill()
+
     async def signal_handler(self) -> None:
         sigints = 0
         with trio.open_signal_receiver(
@@ -203,12 +211,9 @@ class ValheimServer:
                     if self.proc is None:
                         return
                     if sigints >= 3:
-                        LOG.warning("*** Killing server ***")
-                        self.proc.kill()
-                        return
+                        self.kill()
                     if sigints >= 2:
-                        LOG.warning("*** Terminating server ***")
-                        self.proc.terminate()
+                        self.terminate()
                     else:
                         self.shutdown()
                 elif signum == signal.SIGHUP:
@@ -291,6 +296,25 @@ async def publish_new_day(vhs: ValheimServer, mqtt: AsyncClient) -> None:
             mqtt.publish("flyte/valheim/day", day)
 
 
+async def receive_mqtt_messages(vhs: ValheimServer, mqtt: AsyncClient) -> None:
+    mqtt.subscribe("flyte/valheim/cmd")
+    async for msg in mqtt.messages():
+        try:
+            payload = msg.payload.decode("utf8")
+        except UnicodeDecodeError:
+            print("Unable to decode unicode payload. Ignoring.")
+            continue
+        print(f"Received MQTT message on {msg.topic}: {payload}")
+        if payload == "restart":
+            vhs.restart()
+        elif payload == "shutdown":
+            vhs.shutdown()
+        elif payload == "terminate":
+            vhs.terminate()
+        elif payload == "kill":
+            vhs.kill()
+
+
 async def async_main() -> None:
     vhs = ValheimServer("Test", "129355", "51773")
     async with trio.open_nursery() as nursery:
@@ -302,6 +326,7 @@ async def async_main() -> None:
         nursery.start_soon(publish_players, vhs, mqtt)
         nursery.start_soon(publish_discovery, vhs, mqtt)
         nursery.start_soon(publish_new_day, vhs, mqtt)
+        nursery.start_soon(receive_mqtt_messages, vhs, mqtt)
         await vhs.run()
         nursery.cancel_scope.cancel()
 
